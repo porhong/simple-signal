@@ -1,8 +1,10 @@
 """
 Main loop: fetch chart + structure bars from MT5, align, run Pine logic,
 send Telegram alert on new BUY/SELL signals only.
+A background thread long-polls Telegram for /status so it responds quickly.
 """
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -15,14 +17,14 @@ from mt5_data import fetch_bars, initialize_mt5, shutdown_mt5
 from pine_logic import run_state_machine
 
 
-def send_telegram(text: str, bot_token: str, chat_id: str) -> bool:
+def send_telegram(text: str, bot_token: str, chat_id: str, timeout: int = 15) -> bool:
     """Send a message via Telegram Bot API. Returns True on success."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
         r = requests.post(
             url,
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-            timeout=10,
+            timeout=timeout,
         )
         return r.status_code == 200
     except Exception:
@@ -63,6 +65,13 @@ def get_telegram_updates(
         if chat_id and text:
             out.append((chat_id, text))
     return next_offset, out
+
+
+def _redact(s: str, show_tail: int = 4) -> str:
+    """Redact string for display, show last show_tail chars."""
+    if not s or len(s) <= show_tail:
+        return "***"
+    return "*" * (len(s) - show_tail) + s[-show_tail:]
 
 
 def _format_status_reply(cfg: dict[str, Any], mt5_connected: bool = True) -> str:
@@ -132,13 +141,6 @@ def run_once(cfg: dict[str, Any]) -> tuple[bool, bool]:
     return last_buy, last_sell
 
 
-def _redact(s: str, show_tail: int = 4) -> str:
-    """Redact string for display, show last show_tail chars."""
-    if not s or len(s) <= show_tail:
-        return "***"
-    return "*" * (len(s) - show_tail) + s[-show_tail:]
-
-
 def run_status(config_path: str | Path | None = None) -> None:
     """Print bot status and current config (secrets redacted). Does not start the loop."""
     import json as _json
@@ -202,6 +204,32 @@ def run_status(config_path: str | Path | None = None) -> None:
         print("Bot status: NOT WORKING (fix MT5 or config and try again).", flush=True)
 
 
+def _telegram_listener_thread(
+    bot_token: str,
+    chat_id: str,
+    cfg: dict[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    """Long-poll Telegram for /status; reply immediately. Runs in background."""
+    offset = 0
+    # Long poll (25s) so we get /status within ~1–25s without hammering the API
+    poll_timeout = 25
+    while not stop_event.is_set():
+        try:
+            next_offset, updates = get_telegram_updates(
+                bot_token, offset=offset, timeout=poll_timeout
+            )
+            offset = next_offset
+            for cid, text in updates:
+                if text == "/status" and cid == str(chat_id):
+                    reply = _format_status_reply(cfg, mt5_connected=True)
+                    send_telegram(reply, bot_token, cid, timeout=10)
+        except Exception:
+            pass
+        if stop_event.is_set():
+            break
+
+
 def run_bot(config_path: str | Path | None = None) -> None:
     """Load config, init MT5, loop: poll, run logic, send Telegram on new signals."""
     cfg = load_config(config_path)
@@ -220,26 +248,24 @@ def run_bot(config_path: str | Path | None = None) -> None:
         print("MT5 initialization failed. Is MetaTrader 5 running?", file=sys.stderr)
         raise RuntimeError("MT5 initialization failed")
     print("MT5 OK.", flush=True)
-    print(f"Bot started. Symbol={symbol} TF={chart_tf} Poll={poll}s. Press Ctrl+C to stop.", flush=True)
+    print(f"Bot started. Symbol={symbol} TF={chart_tf} Poll={poll}s. Send /status in Telegram for quick reply.", flush=True)
+
+    # Start background thread for fast /status replies (long-poll Telegram)
+    stop_event = threading.Event()
+    listener = threading.Thread(
+        target=_telegram_listener_thread,
+        args=(telegram["bot_token"], telegram["chat_id"], cfg, stop_event),
+        daemon=True,
+    )
+    listener.start()
 
     last_buy = False
     last_sell = False
     loop_count = 0
-    last_update_id = 0
-    configured_chat_id = str(telegram["chat_id"])
 
     try:
         while True:
             try:
-                # Handle Telegram /status command
-                last_update_id, updates = get_telegram_updates(
-                    telegram["bot_token"], offset=last_update_id, timeout=0
-                )
-                for chat_id, text in updates:
-                    if text == "/status" and chat_id == configured_chat_id:
-                        reply = _format_status_reply(cfg, mt5_connected=True)
-                        send_telegram(reply, telegram["bot_token"], chat_id)
-
                 buy_signal, sell_signal = run_once(cfg)
                 if buy_signal and not last_buy:
                     msg = f"SwiftEdge BUY signal on {symbol} (TF={chart_tf})."
@@ -263,5 +289,6 @@ def run_bot(config_path: str | Path | None = None) -> None:
                 send_telegram(err_msg, telegram["bot_token"], telegram["chat_id"])
             time.sleep(poll)
     finally:
+        stop_event.set()
         shutdown_mt5()
         print("Bot stopped.", flush=True)
