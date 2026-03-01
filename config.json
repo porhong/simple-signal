@@ -1,0 +1,14 @@
+{
+  "symbol": "EURUSD",
+  "chart_timeframe": "5M",
+  "structure_timeframe": "",
+  "sma_length": 25,
+  "signal_type": "BoS",
+  "rl_bars": null,
+  "poll_interval_seconds": 60,
+  "telegram": {
+    "bot_token": "YOUR_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID"
+  },
+  "mt5": {}
+}
